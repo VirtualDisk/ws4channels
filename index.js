@@ -32,26 +32,26 @@ const desiredViewMode = (process.env.VIEW_MODE || 'wide').toLowerCase();
 const VIEW_MODE = validViewModes.includes(desiredViewMode) ? desiredViewMode : 'wide';
 
 // set up the width and height constants via immediately invoked function
-const VIEW_DIMENSIONS = (()=>{
-	switch(VIEW_MODE) {
-		case 'standard':
-			return {
-				width: 640,
-				height: 480,
-			}
-		case 'portrait-enhanced':
-			return {
-				width: 720,
-				height: 1280,
-			}
-		case 'wide':
-		case 'wide-enhanced':
-		default:
-			return {
-				width: 1280,
-				height: 720,
-			}
-	}
+const VIEW_DIMENSIONS = (() => {
+  switch (VIEW_MODE) {
+    case 'standard':
+      return {
+        width: 640,
+        height: 480,
+      }
+    case 'portrait-enhanced':
+      return {
+        width: 720,
+        height: 1280,
+      }
+    case 'wide':
+    case 'wide-enhanced':
+    default:
+      return {
+        width: 1280,
+        height: 720,
+      }
+  }
 })();
 
 [OUTPUT_DIR, AUDIO_DIR, LOGO_DIR].forEach(dir => { if (!fs.existsSync(dir)) fs.mkdirSync(dir); });
@@ -83,15 +83,15 @@ function getContainerLimits() {
   let memLimitPath = '/sys/fs/cgroup/memory.max';
   let cpus = os.cpus().length;
   let memory = os.totalmem();
-  try { const [quota, period] = fs.readFileSync(cpuQuotaPath,'utf8').trim().split(' '); if(quota!=='max') cpus=parseFloat((parseInt(quota)/parseInt(period)).toFixed(2)); } catch {}
-  try { const raw = fs.readFileSync(memLimitPath,'utf8').trim(); if(raw!=='max') memory=parseInt(raw); } catch {}
-  return { cpus, memoryMB: Math.round(memory/(1024*1024)) };
+  try { const [quota, period] = fs.readFileSync(cpuQuotaPath, 'utf8').trim().split(' '); if (quota !== 'max') cpus = parseFloat((parseInt(quota) / parseInt(period)).toFixed(2)); } catch { }
+  try { const raw = fs.readFileSync(memLimitPath, 'utf8').trim(); if (raw !== 'max') memory = parseInt(raw); } catch { }
+  return { cpus, memoryMB: Math.round(memory / (1024 * 1024)) };
 }
 
 function createAudioInputFile() {
   const defaultMp3s = [
-    '01 Weatherscan Track 26.mp3','02 Weatherscan Track 3.mp3','03 Tropical Breeze.mp3',
-    '04 Late Nite Cafe.mp3','05 Care Free.mp3','06 Weatherscan Track 14.mp3','07 Weatherscan Track 18.mp3'
+    '01 Weatherscan Track 26.mp3', '02 Weatherscan Track 3.mp3', '03 Tropical Breeze.mp3',
+    '04 Late Nite Cafe.mp3', '05 Care Free.mp3', '06 Weatherscan Track 14.mp3', '07 Weatherscan Track 18.mp3'
   ];
 
   let files = [];
@@ -107,7 +107,7 @@ function createAudioInputFile() {
     console.warn('Using default music list due to error');
     files = defaultMp3s;
   }
-  
+
   // Shuffle if requested
   if (process.env.SHUFFLE_MUSIC?.toLowerCase() === 'true') {
     files = shuffleArray(files);
@@ -133,11 +133,11 @@ function generateXMLTV(host) {
 <display-name>WeatherStar 4000</display-name>
 <icon src="${baseUrl}/logo/ws4000.png" />
 </channel>`;
-  for(let i=0;i<24;i++){
-    const startTime = new Date(now.getTime()+i*3600*1000);
-    const endTime = new Date(startTime.getTime()+3600*1000);
-    const start = startTime.toISOString().replace(/[-:T]/g,'').split('.')[0]+' +0000';
-    const end = endTime.toISOString().replace(/[-:T]/g,'').split('.')[0]+' +0000';
+  for (let i = 0; i < 24; i++) {
+    const startTime = new Date(now.getTime() + i * 3600 * 1000);
+    const endTime = new Date(startTime.getTime() + 3600 * 1000);
+    const start = startTime.toISOString().replace(/[-:T]/g, '').split('.')[0] + ' +0000';
+    const end = endTime.toISOString().replace(/[-:T]/g, '').split('.')[0] + ' +0000';
     xml += `
 <programme start="${start}" stop="${end}" channel="WS4000">
 <title lang="en">Local Weather</title>
@@ -150,10 +150,10 @@ function generateXMLTV(host) {
 }
 
 async function startBrowser() {
-  if(browser) await browser.close().catch(()=>{});
+  if (browser) await browser.close().catch(() => { });
   browser = await puppeteer.launch({
     headless: true,
-    args:['--no-sandbox','--disable-setuid-sandbox','--disable-infobars','--ignore-certificate-errors','--window-size=1280,720'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-infobars', '--ignore-certificate-errors', '--window-size=1280,720'],
     defaultViewport: null
   });
   page = await browser.newPage();
@@ -179,48 +179,48 @@ async function startBrowser() {
         // wait for weather content to update
         await page.waitForSelector('div.weather-display, #weather-content', { timeout: 30000 });
       }
-    } catch {}
+    } catch { }
 
     // force ws4kp app to wide screen and kiosk (full screen), this removes the need to specify exactly where to crop for the screenshot
 
     try {
       // get the widescreen checkbox from the settings section
-			// will throw if the element is not present on ws4kp 7.x and a different path is taken in the catch statement
-			// which is the reason for the short timeout
-      const widescreenCheckbox = await page.waitForSelector('#settings-wide-checkbox', {timeout: 100});
+      // will throw if the element is not present on ws4kp 7.x and a different path is taken in the catch statement
+      // which is the reason for the short timeout
+      const widescreenCheckbox = await page.waitForSelector('#settings-wide-checkbox', { timeout: 100 });
 
 
-			// 6.x (classic) behavior
-			// only supports standard and wide, check and exit with an error if not doable
-			if (VIEW_MODE === 'wide-enhanced' || VIEW_MODE === 'portrait-enhanced') {
-				console.error(`This version of ws4kp only supports VIEW_MODE 'standard' or 'enhanced'`);
-				await browser.close();
-				process.exit();
-			}
-			// get the checkbox's current state and click it to turn it on if necessary
-			const widescreenChecked = await widescreenCheckbox.evaluate((el) => el.checked);
-			// click the checkbox on a mismatch
-			if (widescreenChecked && VIEW_MODE === 'standard' || !widescreenChecked && VIEW_MODE === 'wide') await widescreenCheckbox.click();
+      // 6.x (classic) behavior
+      // only supports standard and wide, check and exit with an error if not doable
+      if (VIEW_MODE === 'wide-enhanced' || VIEW_MODE === 'portrait-enhanced') {
+        console.error(`This version of ws4kp only supports VIEW_MODE 'standard' or 'enhanced'`);
+        await browser.close();
+        process.exit();
+      }
+      // get the checkbox's current state and click it to turn it on if necessary
+      const widescreenChecked = await widescreenCheckbox.evaluate((el) => el.checked);
+      // click the checkbox on a mismatch
+      if (widescreenChecked && VIEW_MODE === 'standard' || !widescreenChecked && VIEW_MODE === 'wide') await widescreenCheckbox.click();
     } catch {
-				try {
-				// 7.x (wide/portrait/enhanced behavior)
-				// get the selector box and select widescreen
-				const viewSelector = await page.waitForSelector('#settings-viewMode-select');
-				// set the desired mode
-				await viewSelector.evaluate((el, VIEW_MODE) => {
-					el.value = VIEW_MODE;
-					el.dispatchEvent(new Event('change'));
-				}, VIEW_MODE);
-			} catch {}
+      try {
+        // 7.x (wide/portrait/enhanced behavior)
+        // get the selector box and select widescreen
+        const viewSelector = await page.waitForSelector('#settings-viewMode-select');
+        // set the desired mode
+        await viewSelector.evaluate((el, VIEW_MODE) => {
+          el.value = VIEW_MODE;
+          el.dispatchEvent(new Event('change'));
+        }, VIEW_MODE);
+      } catch { }
 
-		}
-		finally {
-			// both 6.x and 7.x support kiosk as a checkbox
+    }
+    finally {
+      // both 6.x and 7.x support kiosk as a checkbox
       // and now for kiosk
       const kioskCheckbox = await page.waitForSelector('#settings-kiosk-checkbox');    // set the checkbox
       const kioskChecked = await kioskCheckbox.evaluate((el) => el.checked);
       if (!kioskChecked) await kioskCheckbox.click();
-		}
+    }
   }
   await page.setViewport({ ...VIEW_DIMENSIONS });
 }
@@ -233,65 +233,65 @@ async function startTranscoding() {
     .input(ffmpegStream)
     .inputFormat('image2pipe')
     .inputOptions([`-framerate ${FRAME_RATE}`])
-    .input(path.join(__dirname,'audio_list.txt'))
-    .inputOptions(['-f concat','-safe 0','-stream_loop -1','-vcodec png'])
-    .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`,'[1:a]volume=0.5[a]'])
-    .outputOptions(['-map [v]','-map [a]','-c:v libx264','-c:a aac','-b:a 128k','-preset ultrafast','-b:v 1000k','-f hls','-hls_time 2','-hls_list_size 2','-hls_flags delete_segments'])
+    .input(path.join(__dirname, 'audio_list.txt'))
+    .inputOptions(['-f concat', '-safe 0', '-stream_loop -1', '-vcodec png'])
+    .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`, '[1:a]volume=0.5[a]'])
+    .outputOptions(['-map [v]', '-map [a]', '-c:v libx264', '-c:a aac', '-b:a 128k', '-preset ultrafast', '-b:v 1000k', '-f hls', '-hls_time 2', '-hls_list_size 2', '-hls_flags delete_segments'])
     .output(HLS_FILE)
-    .on('start',()=>{ console.log(`Started FFmpeg - Version ${VERSION}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
-    .on('error', async err=>{ console.error('FFmpeg error:',err); await stopTranscoding(); startTranscoding(); })
-    .on('end',()=>{ ffmpegProc=null; ffmpegStream=null; isStreamReady=false; });
+    .on('start', () => { console.log(`Started FFmpeg - Version ${VERSION}`); setTimeout(() => isStreamReady = true, HLS_SETUP_DELAY); })
+    .on('error', async err => { console.error('FFmpeg error:', err); await stopTranscoding(); startTranscoding(); })
+    .on('end', () => { ffmpegProc = null; ffmpegStream = null; isStreamReady = false; });
 
-  captureInterval = setInterval(async ()=>{
-    if(!ffmpegProc || !ffmpegStream || !page) return;
-    try{
-      if(page.isClosed()){ await startBrowser(); return; }
+  captureInterval = setInterval(async () => {
+    if (!ffmpegProc || !ffmpegStream || !page) return;
+    try {
+      if (page.isClosed()) { await startBrowser(); return; }
       // Updated 16:9 capture for version 1.6
       const screenshot = await page.screenshot({
-        type:'png',
-        clip:{ x:0, y:0, ...VIEW_DIMENSIONS } // crop top, right, and bottom based on your measurements
+        type: 'png',
+        clip: { x: 0, y: 0, ...VIEW_DIMENSIONS } // crop top, right, and bottom based on your measurements
       });
       ffmpegStream.write(screenshot);
-    } catch(err){
+    } catch (err) {
       console.warn('Capture error, retrying...', err.message);
       await startBrowser();
     }
-  },1000/FRAME_RATE);
+  }, 1000 / FRAME_RATE);
 
   ffmpegProc.run();
 }
 
-async function stopTranscoding(){
-  if(captureInterval) clearInterval(captureInterval);
-  captureInterval=null; isStreamReady=false;
-  if(ffmpegProc) ffmpegProc.kill('SIGINT'); ffmpegProc=null;
-  if(browser) await browser.close().catch(()=>{}); browser=null;
+async function stopTranscoding() {
+  if (captureInterval) clearInterval(captureInterval);
+  captureInterval = null; isStreamReady = false;
+  if (ffmpegProc) ffmpegProc.kill('SIGINT'); ffmpegProc = null;
+  if (browser) await browser.close().catch(() => { }); browser = null;
 }
 
-app.get('/playlist.m3u',(req,res)=>{
+app.get('/playlist.m3u', (req, res) => {
   const host = req.headers.host || `localhost:${STREAM_PORT}`;
   const baseUrl = `http://${host}`;
   const m3uContent = `#EXTM3U
 #EXTINF:-1 channel-id="weatherStar4000" tvg-id="weatherStar4000" tvg-channel-no="275" tvc-guide-placeholders="3600" tvc-guide-title="Local Weather" tvc-guide-description="Enjoy your local weather with a touch of nostalgia." tvc-guide-art="${baseUrl}/logo/ws4000.png" tvg-logo="${baseUrl}/logo/ws4000.png",WeatherStar 4000
 ${baseUrl}/stream/stream.m3u8
 `;
-  res.set('Content-Type','application/x-mpegURL'); res.send(m3uContent);
+  res.set('Content-Type', 'application/x-mpegURL'); res.send(m3uContent);
 });
 
-app.get('/guide.xml',(req,res)=>{
+app.get('/guide.xml', (req, res) => {
   const host = req.headers.host || `localhost:${STREAM_PORT}`;
-  res.set('Content-Type','application/xml'); res.send(generateXMLTV(host));
+  res.set('Content-Type', 'application/xml'); res.send(generateXMLTV(host));
 });
 
-app.get('/health',(req,res)=>{ res.status(isStreamReady?200:503).json({ready:isStreamReady}); });
+app.get('/health', (req, res) => { res.status(isStreamReady ? 200 : 503).json({ ready: isStreamReady }); });
 
 const { cpus, memoryMB } = getContainerLimits();
 console.log(`Version ${VERSION} | Running with ${cpus} CPU cores, ${memoryMB}MB RAM`);
 
-app.listen(STREAM_PORT, async ()=>{
+app.listen(STREAM_PORT, async () => {
   console.log(`Streaming server running on port ${STREAM_PORT}`);
   await startTranscoding();
 });
 
-process.on('SIGINT', async ()=>{ console.log('SIGINT received'); await stopTranscoding(); process.exit(); });
-process.on('SIGTERM', async ()=>{ console.log('SIGTERM received'); await stopTranscoding(); process.exit(); });
+process.on('SIGINT', async () => { console.log('SIGINT received'); await stopTranscoding(); process.exit(); });
+process.on('SIGTERM', async () => { console.log('SIGTERM received'); await stopTranscoding(); process.exit(); });
