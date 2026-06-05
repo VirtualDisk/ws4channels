@@ -21,6 +21,7 @@ const FRAME_RATE = parseInt(process.env.FRAME_RATE, 10) || 10;
 // 🔹 Video Recording Configuration
 const WRITE_VIDEO = ['true', '1', 'yes'].includes((process.env.WRITE_VIDEO || '').toLowerCase());
 const WRITE_VIDEO_LENGTH = WRITE_VIDEO ? (parseInt(process.env.WRITE_VIDEO_LENGTH, 10) || 300) : 0;
+const WRITE_VIDEO_FILENAME = process.env.WRITE_VIDEO_FILENAME || 'output.mp4';
 
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const AUDIO_DIR = path.join(__dirname, 'music');
@@ -204,7 +205,7 @@ async function startTranscoding() {
   ffmpegStream = new PassThrough();
   const isMp4Mode = WRITE_VIDEO;
   const outputPath = isMp4Mode
-    ? path.join(OUTPUT_DIR, `output.mp4`)
+    ? path.join(OUTPUT_DIR, WRITE_VIDEO_FILENAME)
     : HLS_FILE;
 
   // 🔹 EXPLICIT VIDEO RECORDING NOTIFICATION
@@ -305,6 +306,7 @@ async function startTranscoding() {
         console.log(`📁 Final Output: ${absPath} (${fileSize})`);
         console.log('🔌 Shutting down capture session...\n');
         stopTranscoding();
+        process.exit(0);
       }
     });
 
