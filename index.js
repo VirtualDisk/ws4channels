@@ -236,16 +236,6 @@ async function startTranscoding() {
     '-b:a', '128k', '-preset', 'ultrafast', '-b:v', '1000k'
   ];
 
-  if (!isMp4Mode) {
-    setInterval(async () => {
-      console.log('♻️  Recreating browser to prevent memory leaks...');
-      if (page && !page.isClosed()) await page.close().catch(() => { });
-      if (browser) await browser.close().catch(() => { });
-      await startBrowser();
-      // Restart capture interval with fresh reference if needed
-    }, 10 * 60 * 1000); // Every 10 minutes
-  }
-
   if (isMp4Mode) {
     outputOpts.push('-movflags', 'faststart');
     if (WRITE_VIDEO_LENGTH > 0) outputOpts.push('-t', String(WRITE_VIDEO_LENGTH));
@@ -346,6 +336,17 @@ async function startTranscoding() {
       await startBrowser();
     }
   }, 1000 / FRAME_RATE);
+
+  if (!isMp4Mode) {
+    setInterval(async () => {
+      console.log('♻️  Recreating browser to prevent memory leaks...');
+      if (page && !page.isClosed()) await page.close().catch(() => { });
+      if (browser) await browser.close().catch(() => { });
+      await startBrowser();
+      // Restart capture interval with fresh reference if needed
+    }, 10 * 60 * 1000); // Every 10 minutes
+  }
+
 }
 
 async function stopTranscoding() {
