@@ -1,4 +1,4 @@
-FROM node:18
+FROM node:24.16
 
 # Install FFmpeg and Puppeteer dependencies
 RUN apt-get update && apt-get install -y \

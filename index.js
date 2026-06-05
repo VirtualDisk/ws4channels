@@ -236,7 +236,7 @@ async function startTranscoding() {
     .input(path.join(__dirname, 'audio_list.txt'))
     .inputOptions(['-f concat', '-safe 0', '-stream_loop -1', '-vcodec png'])
     .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`, '[1:a]volume=0.5[a]'])
-    .outputOptions(['-map [v]', '-map [a]', '-c:v libx264', '-c:a aac', '-b:a 128k', '-preset ultrafast', '-b:v 1000k', '-f hls', '-hls_time 2', '-hls_list_size 2', '-hls_flags delete_segments'])
+    .outputOptions([`-framerate ${FRAME_RATE}`, '-map [v]', '-map [a]', '-c:v libx264', '-c:a aac', '-b:a 128k', '-preset ultrafast', '-b:v 1000k', '-f hls', '-hls_time 2', '-hls_list_size 2', '-hls_flags delete_segments',])
     .output(HLS_FILE)
     .on('start', () => { console.log(`Started FFmpeg - Version ${VERSION}`); setTimeout(() => isStreamReady = true, HLS_SETUP_DELAY); })
     .on('error', async err => { console.error('FFmpeg error:', err); await stopTranscoding(); startTranscoding(); })
