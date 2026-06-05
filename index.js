@@ -7,8 +7,8 @@ const { PassThrough } = require('stream');
 const os = require('os');
 
 const app = express();
+const VERSION = '2.0';
 
-const VERSION = '2.0'; // version 2.0 logging
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
@@ -16,45 +16,34 @@ const STREAM_PORT = process.env.STREAM_PORT || '9798';
 const WS4KP_URL = `http://${WS4KP_HOST}:${WS4KP_PORT}`;
 const PERMALINK_URL = process.env.PERMALINK_URL || null;
 const HLS_SETUP_DELAY = 2000;
-const FRAME_RATE = process.env.FRAME_RATE || 10;
+const FRAME_RATE = parseInt(process.env.FRAME_RATE, 10) || 10;
+
+// 🔹 Video Recording Configuration
+const WRITE_VIDEO = ['true', '1', 'yes'].includes((process.env.WRITE_VIDEO || '').toLowerCase());
+const WRITE_VIDEO_LENGTH = WRITE_VIDEO ? (parseInt(process.env.WRITE_VIDEO_LENGTH, 10) || 300) : 0;
 
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const AUDIO_DIR = path.join(__dirname, 'music');
 const LOGO_DIR = path.join(__dirname, 'logo');
 const HLS_FILE = path.join(OUTPUT_DIR, 'stream.m3u8');
 
-// ws4kp 7.x supports 4 view modes: standard, wide, wide-enhanced, portrait-enhanced
-// sort out the user's preferences and set up appropriate constants
 const validViewModes = ['standard', 'wide', 'wide-enhanced', 'portrait-enhanced'];
-// get the view mode (or default) and make it lower case
 const desiredViewMode = (process.env.VIEW_MODE || 'wide').toLowerCase();
-// test against the valid modes and set up the constant
 const VIEW_MODE = validViewModes.includes(desiredViewMode) ? desiredViewMode : 'wide';
 
-// set up the width and height constants via immediately invoked function
 const VIEW_DIMENSIONS = (() => {
   switch (VIEW_MODE) {
-    case 'standard':
-      return {
-        width: 640,
-        height: 480,
-      }
-    case 'portrait-enhanced':
-      return {
-        width: 720,
-        height: 1280,
-      }
+    case 'standard': return { width: 640, height: 480 };
+    case 'portrait-enhanced': return { width: 720, height: 1280 };
     case 'wide':
     case 'wide-enhanced':
-    default:
-      return {
-        width: 1280,
-        height: 720,
-      }
+    default: return { width: 1280, height: 720 };
   }
 })();
 
-[OUTPUT_DIR, AUDIO_DIR, LOGO_DIR].forEach(dir => { if (!fs.existsSync(dir)) fs.mkdirSync(dir); });
+[OUTPUT_DIR, AUDIO_DIR, LOGO_DIR].forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
 
 app.use('/stream', express.static(OUTPUT_DIR));
 app.use('/logo', express.static(LOGO_DIR));
@@ -66,9 +55,12 @@ let page = null;
 let captureInterval = null;
 let isStreamReady = false;
 
+// 🔹 Video Recording State
+let recordingStartTime = null;
+let videoProgressInterval = null;
+
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// Helper: Fisher–Yates shuffle
 function shuffleArray(array) {
   const arr = array.slice();
   for (let i = arr.length - 1; i > 0; i--) {
@@ -83,8 +75,14 @@ function getContainerLimits() {
   let memLimitPath = '/sys/fs/cgroup/memory.max';
   let cpus = os.cpus().length;
   let memory = os.totalmem();
-  try { const [quota, period] = fs.readFileSync(cpuQuotaPath, 'utf8').trim().split(' '); if (quota !== 'max') cpus = parseFloat((parseInt(quota) / parseInt(period)).toFixed(2)); } catch { }
-  try { const raw = fs.readFileSync(memLimitPath, 'utf8').trim(); if (raw !== 'max') memory = parseInt(raw); } catch { }
+  try {
+    const [quota, period] = fs.readFileSync(cpuQuotaPath, 'utf8').trim().split(' ');
+    if (quota !== 'max') cpus = parseFloat((parseInt(quota) / parseInt(period)).toFixed(2));
+  } catch { }
+  try {
+    const raw = fs.readFileSync(memLimitPath, 'utf8').trim();
+    if (raw !== 'max') memory = parseInt(raw);
+  } catch { }
   return { cpus, memoryMB: Math.round(memory / (1024 * 1024)) };
 }
 
@@ -93,10 +91,8 @@ function createAudioInputFile() {
     '01 Weatherscan Track 26.mp3', '02 Weatherscan Track 3.mp3', '03 Tropical Breeze.mp3',
     '04 Late Nite Cafe.mp3', '05 Care Free.mp3', '06 Weatherscan Track 14.mp3', '07 Weatherscan Track 18.mp3'
   ];
-
   let files = [];
   try {
-    // Read only MP3 files from AUDIO_DIR
     files = fs.readdirSync(AUDIO_DIR).filter(file => file.toLowerCase().endsWith('.mp3'));
     if (files.length === 0) {
       console.warn('No MP3 files found in music directory; using default music list');
@@ -107,20 +103,13 @@ function createAudioInputFile() {
     console.warn('Using default music list due to error');
     files = defaultMp3s;
   }
-
-  // Shuffle if requested
   if (process.env.SHUFFLE_MUSIC?.toLowerCase() === 'true') {
     files = shuffleArray(files);
     console.log('Shuffled music list based on SHUFFLE_MUSIC=true');
   }
-
   console.log(`Loaded ${files.length} music files`);
   const audioList = files.map(file => `file '${path.join(AUDIO_DIR, file)}'`).join('\n');
   fs.writeFileSync(path.join(__dirname, 'audio_list.txt'), audioList);
-
-
-  // Note: Update README to inform users they can add MP3 files to the 'music' folder
-  // and that the default files (listed above) are used if no MP3s are found.
 }
 
 function generateXMLTV(host) {
@@ -150,12 +139,19 @@ function generateXMLTV(host) {
 }
 
 async function startBrowser() {
-  if (browser) await browser.close().catch(() => { });
+  if (browser) {
+    console.log('🔄 Closing existing browser instance...');
+    await browser.close().catch(() => { });
+    // Force Node's GC to reclaim Chromium's RAM
+    if (global.gc) global.gc();
+  }
+
   browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-infobars', '--ignore-certificate-errors', '--window-size=1280,720'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     defaultViewport: null
   });
+
   page = await browser.newPage();
   if (PERMALINK_URL) {
     console.log(`Using custom permalink URL: ${PERMALINK_URL}`);
@@ -165,59 +161,35 @@ async function startBrowser() {
     try {
       const zipInput = await page.waitForSelector('input[placeholder="Zip or City, State"], input', { timeout: 5000 });
       if (zipInput) {
-        // type the zip code
         await zipInput.type(ZIP_CODE, { delay: 100 });
-        // wit for suggestions box
         await page.waitForSelector('#divQuery .autocomplete-suggestions .suggestion');
-        // select the first suggestion
         await page.keyboard.press('ArrowDown');
-        // wait for the selection to be highlighted
         await page.waitForSelector('#divQuery .autocomplete-suggestions .suggestion.selected');
-        // find and press the submit button
         const goButton = await page.$('button[type="submit"]');
         if (goButton) await goButton.click(); else await zipInput.press('Enter');
-        // wait for weather content to update
         await page.waitForSelector('div.weather-display, #weather-content', { timeout: 30000 });
       }
     } catch { }
-
-    // force ws4kp app to wide screen and kiosk (full screen), this removes the need to specify exactly where to crop for the screenshot
-
     try {
-      // get the widescreen checkbox from the settings section
-      // will throw if the element is not present on ws4kp 7.x and a different path is taken in the catch statement
-      // which is the reason for the short timeout
       const widescreenCheckbox = await page.waitForSelector('#settings-wide-checkbox', { timeout: 100 });
-
-
-      // 6.x (classic) behavior
-      // only supports standard and wide, check and exit with an error if not doable
       if (VIEW_MODE === 'wide-enhanced' || VIEW_MODE === 'portrait-enhanced') {
         console.error(`This version of ws4kp only supports VIEW_MODE 'standard' or 'enhanced'`);
         await browser.close();
-        process.exit();
+        process.exit(1);
       }
-      // get the checkbox's current state and click it to turn it on if necessary
       const widescreenChecked = await widescreenCheckbox.evaluate((el) => el.checked);
-      // click the checkbox on a mismatch
       if (widescreenChecked && VIEW_MODE === 'standard' || !widescreenChecked && VIEW_MODE === 'wide') await widescreenCheckbox.click();
     } catch {
       try {
-        // 7.x (wide/portrait/enhanced behavior)
-        // get the selector box and select widescreen
         const viewSelector = await page.waitForSelector('#settings-viewMode-select');
-        // set the desired mode
         await viewSelector.evaluate((el, VIEW_MODE) => {
           el.value = VIEW_MODE;
           el.dispatchEvent(new Event('change'));
         }, VIEW_MODE);
       } catch { }
-
     }
     finally {
-      // both 6.x and 7.x support kiosk as a checkbox
-      // and now for kiosk
-      const kioskCheckbox = await page.waitForSelector('#settings-kiosk-checkbox');    // set the checkbox
+      const kioskCheckbox = await page.waitForSelector('#settings-kiosk-checkbox');
       const kioskChecked = await kioskCheckbox.evaluate((el) => el.checked);
       if (!kioskChecked) await kioskCheckbox.click();
     }
@@ -228,44 +200,162 @@ async function startBrowser() {
 async function startTranscoding() {
   await startBrowser();
   createAudioInputFile();
+
   ffmpegStream = new PassThrough();
-  ffmpegProc = ffmpeg()
+  const isMp4Mode = WRITE_VIDEO;
+  const outputPath = isMp4Mode
+    ? path.join(OUTPUT_DIR, `weather_recording_${Date.now()}.mp4`)
+    : HLS_FILE;
+
+  // 🔹 EXPLICIT VIDEO RECORDING NOTIFICATION
+  if (isMp4Mode) {
+    const absPath = path.resolve(outputPath);
+    console.log('\n' + '='.repeat(60));
+    console.log('▶ VIDEO RECORDING MODE ACTIVATED');
+    console.log(`📹 Output File: ${absPath}`);
+    console.log(`⏱️  Duration:   ${WRITE_VIDEO_LENGTH > 0 ? `${WRITE_VIDEO_LENGTH} seconds` : 'Infinite (Ctrl+C to stop)'}`);
+    console.log('▶ Writing video to disk...');
+    console.log('='.repeat(60) + '\n');
+  }
+
+  const ffmpegCmd = ffmpeg()
     .input(ffmpegStream)
     .inputFormat('image2pipe')
-    .inputOptions([`-framerate ${FRAME_RATE}`])
+    .addInputOptions(['-framerate', String(FRAME_RATE)])
     .input(path.join(__dirname, 'audio_list.txt'))
-    .inputOptions(['-f concat', '-safe 0', '-stream_loop -1', '-vcodec png'])
-    .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`, '[1:a]volume=0.5[a]'])
-    .outputOptions([`-framerate ${FRAME_RATE}`, '-map [v]', '-map [a]', '-c:v libx264', '-c:a aac', '-b:a 128k', '-preset ultrafast', '-b:v 1000k', '-f hls', '-hls_time 2', '-hls_list_size 2', '-hls_flags delete_segments',])
-    .output(HLS_FILE)
-    .on('start', () => { console.log(`Started FFmpeg - Version ${VERSION}`); setTimeout(() => isStreamReady = true, HLS_SETUP_DELAY); })
-    .on('error', async err => { console.error('FFmpeg error:', err); await stopTranscoding(); startTranscoding(); })
-    .on('end', () => { ffmpegProc = null; ffmpegStream = null; isStreamReady = false; });
+    .addInputOptions(['-f', 'concat', '-safe', '0', '-stream_loop', '-1'])
+    .complexFilter([
+      `[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`,
+      `[1:a]volume=0.5[a]`
+    ]);
+
+  const outputOpts = [
+    '-framerate', String(FRAME_RATE),
+    '-map', '[v]', '-map', '[a]',
+    '-c:v', 'libx264', '-c:a', 'aac',
+    '-b:a', '128k', '-preset', 'ultrafast', '-b:v', '1000k'
+  ];
+
+  if (!isMp4Mode) {
+    setInterval(async () => {
+      console.log('♻️  Recreating browser to prevent memory leaks...');
+      if (page && !page.isClosed()) await page.close().catch(() => { });
+      if (browser) await browser.close().catch(() => { });
+      await startBrowser();
+      // Restart capture interval with fresh reference if needed
+    }, 10 * 60 * 1000); // Every 10 minutes
+  }
+
+  if (isMp4Mode) {
+    outputOpts.push('-movflags', 'faststart');
+    if (WRITE_VIDEO_LENGTH > 0) outputOpts.push('-t', String(WRITE_VIDEO_LENGTH));
+  } else {
+    outputOpts.push('-f', 'hls', '-hls_time', '2', '-hls_list_size', '2', '-hls_flags', 'delete_segments');
+  }
+
+  ffmpegCmd.outputOptions(outputOpts);
+  ffmpegCmd.output(outputPath);
+
+  ffmpegProc = ffmpegCmd.run();
+
+  ffmpegProc
+    .on('start', () => {
+      console.log('▶ FFmpeg capture stream initialized');
+      isStreamReady = true;
+      recordingStartTime = Date.now();
+
+      if (isMp4Mode && WRITE_VIDEO_LENGTH > 0) {
+        videoProgressInterval = setInterval(() => {
+          const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+          const remaining = WRITE_VIDEO_LENGTH - elapsed;
+          const percent = Math.min(100, Math.max(0, (elapsed / WRITE_VIDEO_LENGTH) * 100)).toFixed(1);
+          const pad = n => n.toString().padStart(2, '0');
+          const eStr = `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)}`;
+          const tStr = `${pad(Math.floor(WRITE_VIDEO_LENGTH / 60))}:${pad(WRITE_VIDEO_LENGTH % 60)}`;
+          console.log(`▶ RECORDING: ${eStr} / ${tStr} (${percent}%) | Writing to: ${outputPath}`);
+
+          if (remaining <= 10 && remaining > 0) {
+            console.log(`⚠️  Recording will finalize in ${remaining} seconds...`);
+          }
+        }, 5000);
+      }
+
+      if (isMp4Mode && WRITE_VIDEO_LENGTH > 0) {
+        setTimeout(() => {
+          if (ffmpegStream && !ffmpegStream.destroyed) {
+            clearInterval(videoProgressInterval);
+            console.log('\n⏱️  Recording duration reached. Finalizing MP4 file...\n');
+            ffmpegStream.end();
+          }
+        }, WRITE_VIDEO_LENGTH * 1000);
+      }
+    })
+    .on('progress', (progress) => {
+      // Optional: Uncomment to see raw FFmpeg frame/size progress
+      // console.log(`▶ FFmpeg progress: ${progress.percent}% frames processed`);
+    })
+    .on('error', async (err) => {
+      console.error('▶ FFmpeg error:', err.message);
+      await stopTranscoding();
+      if (!isMp4Mode) {
+        console.log('▶ Attempting HLS stream recovery in 2s...');
+        setTimeout(startTranscoding, 2000);
+      }
+    })
+    .on('end', () => {
+      if (videoProgressInterval) clearInterval(videoProgressInterval);
+      ffmpegProc = null;
+      ffmpegStream = null;
+      isStreamReady = false;
+
+      if (isMp4Mode) {
+        const absPath = path.resolve(outputPath);
+        const fileSize = fs.existsSync(absPath) ? `${(fs.statSync(absPath).size / (1024 * 1024)).toFixed(2)} MB` : '0 MB';
+        console.log('✅ Recording complete.');
+        console.log(`📁 Final Output: ${absPath} (${fileSize})`);
+        console.log('🔌 Shutting down capture session...\n');
+        stopTranscoding();
+      }
+    });
+
+  let streamBlocked = false;
+  ffmpegStream.on('drain', () => {
+    if (streamBlocked) console.log('▶ Stream buffer cleared, resuming captures...');
+    streamBlocked = false;
+  });
 
   captureInterval = setInterval(async () => {
-    if (!ffmpegProc || !ffmpegStream || !page) return;
+    if (!ffmpegProc || !page) return;
     try {
       if (page.isClosed()) { await startBrowser(); return; }
-      // Updated 16:9 capture for version 1.6
+
+      // 🔹 JPEG reduces buffer size by 5-10x vs PNG. Quality 75-85 is fine for screen capture.
       const screenshot = await page.screenshot({
-        type: 'png',
-        clip: { x: 0, y: 0, ...VIEW_DIMENSIONS } // crop top, right, and bottom based on your measurements
+        type: 'jpeg',
+        quality: 80,
+        clip: { x: 0, y: 0, ...VIEW_DIMENSIONS }
       });
-      ffmpegStream.write(screenshot);
+
+      // 🔹 Handle backpressure explicitly
+      if (!streamBlocked) {
+        streamBlocked = !ffmpegStream.write(screenshot);
+        if (streamBlocked) console.log('▶ Stream buffer full, pausing screenshots...');
+      }
     } catch (err) {
-      console.warn('Capture error, retrying...', err.message);
+      console.warn('▶ Capture error, retrying...', err.message);
       await startBrowser();
     }
   }, 1000 / FRAME_RATE);
-
-  ffmpegProc.run();
 }
 
 async function stopTranscoding() {
-  if (captureInterval) clearInterval(captureInterval);
-  captureInterval = null; isStreamReady = false;
-  if (ffmpegProc) ffmpegProc.kill('SIGINT'); ffmpegProc = null;
-  if (browser) await browser.close().catch(() => { }); browser = null;
+  if (videoProgressInterval) { clearInterval(videoProgressInterval); videoProgressInterval = null; }
+  if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
+  isStreamReady = false;
+  if (ffmpegStream) { try { ffmpegStream.end(); } catch { } }
+  if (ffmpegProc) { try { ffmpegProc.kill('SIGINT'); } catch { } ffmpegProc = null; }
+  if (browser) { await browser.close().catch(() => { }); browser = null; }
+  if (page) { try { await page.close(); } catch { } page = null; }
 }
 
 app.get('/playlist.m3u', (req, res) => {
@@ -283,15 +373,25 @@ app.get('/guide.xml', (req, res) => {
   res.set('Content-Type', 'application/xml'); res.send(generateXMLTV(host));
 });
 
-app.get('/health', (req, res) => { res.status(isStreamReady ? 200 : 503).json({ ready: isStreamReady }); });
+app.get('/health', (req, res) => {
+  res.status(isStreamReady ? 200 : 503).json({ ready: isStreamReady });
+});
 
 const { cpus, memoryMB } = getContainerLimits();
 console.log(`Version ${VERSION} | Running with ${cpus} CPU cores, ${memoryMB}MB RAM`);
 
 app.listen(STREAM_PORT, async () => {
-  console.log(`Streaming server running on port ${STREAM_PORT}`);
+  console.log(`▶ Server running on port ${STREAM_PORT}`);
   await startTranscoding();
 });
 
-process.on('SIGINT', async () => { console.log('SIGINT received'); await stopTranscoding(); process.exit(); });
-process.on('SIGTERM', async () => { console.log('SIGTERM received'); await stopTranscoding(); process.exit(); });
+process.on('SIGINT', async () => {
+  console.log('\n▶ SIGINT received. Stopping capture...');
+  await stopTranscoding();
+  process.exit(0);
+});
+process.on('SIGTERM', async () => {
+  console.log('\n▶ SIGTERM received. Stopping capture...');
+  await stopTranscoding();
+  process.exit(0);
+});
