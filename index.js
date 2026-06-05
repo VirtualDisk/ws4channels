@@ -204,7 +204,7 @@ async function startTranscoding() {
   ffmpegStream = new PassThrough();
   const isMp4Mode = WRITE_VIDEO;
   const outputPath = isMp4Mode
-    ? path.join(OUTPUT_DIR, `weather_recording_${Date.now()}.mp4`)
+    ? path.join(OUTPUT_DIR, `output.mp4`)
     : HLS_FILE;
 
   // 🔹 EXPLICIT VIDEO RECORDING NOTIFICATION
