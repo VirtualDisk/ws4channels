@@ -247,7 +247,7 @@ async function startTranscoding() {
     .input(path.join(__dirname, 'audio_list.txt'))
     .addInputOptions(['-f', 'concat', '-safe', '0', '-stream_loop', '-1'])
     .complexFilter([
-      `[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`,
+      `[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}:flags=bilinear[v]`,
       `[1:a]volume=0.5[a]`
     ]);
 
