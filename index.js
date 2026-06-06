@@ -334,12 +334,6 @@ async function startTranscoding() {
       }
     });
 
-  let streamBlocked = false;
-  ffmpegStream.on('drain', () => {
-    if (streamBlocked) console.log('▶ Stream buffer cleared, resuming captures...');
-    streamBlocked = false;
-  });
-
   let capturing = false;
   let streamPaused = false;
 
