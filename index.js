@@ -149,7 +149,14 @@ async function startBrowser() {
 
   browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--force-device-scale-factor=1',              // 🛑 Critical: prevents DPR drift
+      `--window-size=${VIEW_DIMENSIONS.width},${VIEW_DIMENSIONS.height}` // 🛑 Locks internal buffer size
+    ],
     defaultViewport: null
   });
 
@@ -196,6 +203,20 @@ async function startBrowser() {
     }
   }
   await page.setViewport({ ...VIEW_DIMENSIONS });
+
+  await page.setViewport({
+    width: VIEW_DIMENSIONS.width,
+    height: VIEW_DIMENSIONS.height,
+    deviceScaleFactor: 1
+  });
+
+  // Force DOM layout to match viewport exactly (prevents layout shifts under load)
+  await page.evaluate((w, h) => {
+    document.body.style.margin = '0';
+    document.body.style.padding = '0';
+    document.body.style.width = `${w}px`;
+    document.documentElement.style.overflow = 'hidden';
+  }, VIEW_DIMENSIONS.width, VIEW_DIMENSIONS.height);
 }
 
 async function startTranscoding() {
@@ -316,28 +337,44 @@ async function startTranscoding() {
     streamBlocked = false;
   });
 
+  let capturing = false;
+  let streamPaused = false;
+
   captureInterval = setInterval(async () => {
     if (!ffmpegProc || !page) return;
+
     try {
       if (page.isClosed()) { await startBrowser(); return; }
 
-      // 🔹 JPEG reduces buffer size by 5-10x vs PNG. Quality 75-85 is fine for screen capture.
-      const screenshot = await page.screenshot({
-        type: 'jpeg',
-        quality: 80,
-        clip: { x: 0, y: 0, ...VIEW_DIMENSIONS }
-      });
+      // 🛑 Timeout prevents CPU starvation cascades on lower-end systems
+      const screenshot = await Promise.race([
+        page.screenshot({ type: 'jpeg', quality: 75 }), // Removed clip, lowered quality for speed
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Screenshot timeout')), 100))
+      ]).catch(() => null);
 
-      // 🔹 Handle backpressure explicitly
-      if (!streamBlocked) {
-        streamBlocked = !ffmpegStream.write(screenshot);
-        if (streamBlocked) console.log('▶ Stream buffer full, pausing screenshots...');
+      if (!screenshot) return; // Drop frame instead of queuing/blocking
+
+      const drained = ffmpegStream.write(screenshot);
+      if (!drained && !streamPaused) {
+        console.log('▶ Stream buffer full, pausing captures...');
+        streamPaused = true;
+        ffmpegStream.pause();
       }
     } catch (err) {
       console.warn('▶ Capture error, retrying...', err.message);
-      await startBrowser();
+    } finally {
+      capturing = false;
     }
   }, 1000 / FRAME_RATE);
+
+  // Resume only when FFmpeg is ready to accept more data
+  ffmpegStream.on('drain', () => {
+    if (streamPaused) {
+      console.log('▶ Stream buffer cleared, resuming captures...');
+      streamPaused = false;
+      ffmpegStream.resume();
+    }
+  });
 
   if (!isMp4Mode) {
     setInterval(async () => {
