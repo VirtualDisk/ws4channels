@@ -87,6 +87,9 @@ function getContainerLimits() {
   return { cpus, memoryMB: Math.round(memory / (1024 * 1024)) };
 }
 
+const load = os.loadavg()[0] / os.cpus().length;
+if (load > 1.5) console.warn('⚠️ High system load detected. Consider lowering FRAME_RATE or using ultrafast preset.');
+
 function createAudioInputFile() {
   const defaultMp3s = [
     '01 Weatherscan Track 26.mp3', '02 Weatherscan Track 3.mp3', '03 Tropical Breeze.mp3',
