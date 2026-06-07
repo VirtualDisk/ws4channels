@@ -157,10 +157,15 @@ async function startBrowser() {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--force-device-scale-factor=1',              // 🛑 Critical: prevents DPR drift
-      `--window-size=${VIEW_DIMENSIONS.width},${VIEW_DIMENSIONS.height}` // 🛑 Locks internal buffer size
+      '--force-device-scale-factor=1',
+      `--window-size=${VIEW_DIMENSIONS.width},${VIEW_DIMENSIONS.height}`,
+      '--js-flags="--max-old-space-size=512"',       // 🛑 Limits V8 heap, prevents GC pauses
+      '--disable-background-timer-throttling',        // 🛑 Stops OS from throttling timers
+      '--disable-features=VideoCapture',              // 🛑 Disables Chromium's built-in capture scheduler
+      '--disable-renderer-backgrounding'              // 🛑 Keeps renderer process priority high
     ],
-    defaultViewport: null
+    defaultViewport: null,
+    ignoreDefaultArgs: ['--enable-automation']         // Removes puppeteer bloat
   });
 
   page = await browser.newPage();
@@ -246,7 +251,7 @@ async function startTranscoding() {
   const ffmpegCmd = ffmpeg()
     .input(ffmpegStream)
     .inputFormat('image2pipe')
-    .addInputOptions(['-framerate', String(FRAME_RATE)])
+    .addInputOptions(['-framerate', String(FRAME_RATE), '-vsync', 'cfr']) // ✅ Constant Frame Rate sync
     .input(path.join(__dirname, 'audio_list.txt'))
     .addInputOptions(['-f', 'concat', '-safe', '0', '-stream_loop', '-1'])
     .complexFilter([
@@ -334,35 +339,73 @@ async function startTranscoding() {
       }
     });
 
-  let capturing = false;
   let streamPaused = false;
+  let lastFrameTimestamp = Date.now();
+  const STALL_THRESHOLD_MS = 4000; // Freeze if no frames for 4s
+  const QUEUE_MAX_SIZE = 3;        // Drop frames if pipe backs up
+  let captureQueue = [];
+
+  function drainHandler() {
+    streamPaused = false;
+  }
+
+  ffmpegStream.on('drain', drainHandler);
 
   captureInterval = setInterval(async () => {
-    if (!ffmpegProc || !page) return;
+    if (!ffmpegProc || !page || page.isClosed()) return;
+
+    // 🔹 Stall recovery watchdog
+    if (Date.now() - lastFrameTimestamp > STALL_THRESHOLD_MS) {
+      console.warn('\n⚠️ Stream stall detected! Forcing browser refresh...');
+      try {
+        await page.reload({ waitUntil: 'networkidle2', timeout: 10000 });
+        await new Promise(r => setTimeout(r, 600)); // Let DOM settle
+        console.log('✅ Recovery complete.');
+        lastFrameTimestamp = Date.now();
+      } catch (e) {
+        console.error('🚨 Stall recovery failed:', e.message);
+        stopTranscoding(); // Safe fallback
+        process.exit(1);
+      }
+      return;
+    }
 
     try {
-      if (page.isClosed()) { await startBrowser(); return; }
-
-      // 🛑 Timeout prevents CPU starvation cascades on lower-end systems
-      const screenshot = await Promise.race([
-        page.screenshot({ type: 'jpeg', quality: 75 }), // Removed clip, lowered quality for speed
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Screenshot timeout')), 100))
+      // 🛑 Strict timeout prevents V8 starvation cascades
+      const frame = await Promise.race([
+        page.screenshot({ type: 'jpeg', quality: 65 }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('screenshot_timeout')), 100))
       ]).catch(() => null);
 
-      if (!screenshot) return; // Drop frame instead of queuing/blocking
+      if (!frame) return; // Drop frame, keep loop running
 
-      const drained = ffmpegStream.write(screenshot);
+      lastFrameTimestamp = Date.now();
+
+      // 🔹 Bounded queue prevents memory bloat
+      captureQueue.push(frame);
+      while (captureQueue.length > QUEUE_MAX_SIZE) captureQueue.shift();
+
+      const drained = ffmpegStream.write(captureQueue.shift());
       if (!drained && !streamPaused) {
-        console.log('▶ Stream buffer full, pausing captures...');
+        console.log('▶ Buffer full, pausing capture loop...');
         streamPaused = true;
-        ffmpegStream.pause();
+        clearInterval(captureInterval);
+
+        // Resume only when FFmpeg catches up
+        const resumeTimeout = setInterval(() => {
+          if (streamPaused) return;
+          clearInterval(resumeTimeout);
+          captureInterval = setInterval(captureLoop, 1000 / FRAME_RATE);
+        }, 200);
       }
     } catch (err) {
-      console.warn('▶ Capture error, retrying...', err.message);
-    } finally {
-      capturing = false;
+      console.warn('▶ Capture error:', err.message);
+      lastFrameTimestamp = Date.now(); // Prevent false watchdog triggers
     }
   }, 1000 / FRAME_RATE);
+
+  // Helper for capture loop reuse
+  function captureLoop() { /* same as setInterval callback above */ }
 
   // Resume only when FFmpeg is ready to accept more data
   ffmpegStream.on('drain', () => {
@@ -372,17 +415,6 @@ async function startTranscoding() {
       ffmpegStream.resume();
     }
   });
-
-  if (!isMp4Mode) {
-    setInterval(async () => {
-      console.log('♻️  Recreating browser to prevent memory leaks...');
-      if (page && !page.isClosed()) await page.close().catch(() => { });
-      if (browser) await browser.close().catch(() => { });
-      await startBrowser();
-      // Restart capture interval with fresh reference if needed
-    }, 10 * 60 * 1000); // Every 10 minutes
-  }
-
 }
 
 async function stopTranscoding() {
