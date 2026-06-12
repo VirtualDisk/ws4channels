@@ -22,6 +22,13 @@ const WRITE_VIDEO = ['true', '1', 'yes'].includes((process.env.WRITE_VIDEO || ''
 const WRITE_VIDEO_LENGTH = WRITE_VIDEO ? (parseInt(process.env.WRITE_VIDEO_LENGTH, 10) || 300) : 0;
 const WRITE_VIDEO_FILENAME = process.env.WRITE_VIDEO_FILENAME || 'output.mp4';
 
+// HLS watchdog: how stale the newest segment may get before we treat the
+// stream as frozen and trigger recovery.
+const SEGMENT_STALE_SECONDS = parseInt(process.env.SEGMENT_STALE_SECONDS, 10) || 15;
+
+// JPEG quality for captured frames (1-100). Lower = faster/smaller.
+const SCREENSHOT_QUALITY = parseInt(process.env.SCREENSHOT_QUALITY, 10) || 75;
+
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const AUDIO_DIR = path.join(__dirname, 'music');
 const LOGO_DIR = path.join(__dirname, 'logo');
@@ -53,13 +60,15 @@ let ffmpegCmd = null;      // the fluent-ffmpeg command instance (has .kill())
 let ffmpegStream = null;   // the PassThrough pipe into ffmpeg's stdin
 let browser = null;
 let page = null;
-let captureInterval = null;
+let cdpClient = null;      // CDP session driving Page.startScreencast
 let browserRefreshTimer = null;
 let isStreamReady = false;
 let isBrowserRestarting = false;  // guard: pause captures during browser restart
 
 let recordingStartTime = null;
 let videoProgressInterval = null;
+let segmentWatchdog = null;
+let lastSegmentVerified = null;
 
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -222,6 +231,160 @@ async function startBrowser() {
   }, VIEW_DIMENSIONS.width, VIEW_DIMENSIONS.height);
 }
 
+// Probe a finished recording and throw if it shows the failure modes we just
+// fixed: a video stream shorter than the audio/target (the "freeze halfway"
+// bug) or a non-yuv420p pixel format that players/uploaders reject.
+function verifyRecording(filePath, targetSeconds) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, data) => {
+      if (err) return reject(new Error(`ffprobe failed: ${err.message}`));
+
+      const video = data.streams.find(s => s.codec_type === 'video');
+      const audio = data.streams.find(s => s.codec_type === 'audio');
+      if (!video) return reject(new Error('no video stream in output'));
+      if (!audio) return reject(new Error('no audio stream in output'));
+
+      if (video.pix_fmt !== 'yuv420p') {
+        return reject(new Error(`video pix_fmt is "${video.pix_fmt}", expected yuv420p (won't upload/play on many platforms)`));
+      }
+
+      const vDur = parseFloat(video.duration ?? data.format.duration);
+      const aDur = parseFloat(audio.duration ?? data.format.duration);
+
+      // Video and audio must end at roughly the same time — a large gap means
+      // the picture froze while audio kept playing.
+      if (Number.isFinite(vDur) && Number.isFinite(aDur) && Math.abs(vDur - aDur) > 2) {
+        return reject(new Error(`video/audio duration mismatch: video ${vDur.toFixed(1)}s vs audio ${aDur.toFixed(1)}s (picture likely freezes)`));
+      }
+
+      // If a target length was requested, the file should be close to it.
+      if (targetSeconds > 0 && Number.isFinite(vDur)) {
+        const tolerance = Math.max(2, targetSeconds * 0.05);
+        if (Math.abs(vDur - targetSeconds) > tolerance) {
+          return reject(new Error(`recording is ${vDur.toFixed(1)}s, expected ~${targetSeconds}s (±${tolerance.toFixed(1)}s)`));
+        }
+      }
+
+      resolve({ vDur, aDur, pix_fmt: video.pix_fmt });
+    });
+  });
+}
+
+// Newest-first list of HLS segment files, resilient to segments being deleted
+// by -hls_flags delete_segments mid-scan.
+function listSegments() {
+  return fs.readdirSync(OUTPUT_DIR)
+    .filter(f => f.endsWith('.ts'))
+    .map(f => {
+      try {
+        const p = path.join(OUTPUT_DIR, f);
+        return { path: p, mtime: fs.statSync(p).mtimeMs };
+      } catch { return null; }
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.mtime - a.mtime);
+}
+
+// Lightweight content check for a single HLS segment.
+function probeSegment(filePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, data) => {
+      if (err) return reject(new Error(`ffprobe failed: ${err.message}`));
+      const video = data.streams.find(s => s.codec_type === 'video');
+      const audio = data.streams.find(s => s.codec_type === 'audio');
+      if (!video) return reject(new Error('segment has no video stream'));
+      if (!audio) return reject(new Error('segment has no audio stream'));
+      if (video.pix_fmt !== 'yuv420p') {
+        return reject(new Error(`segment pix_fmt is "${video.pix_fmt}", expected yuv420p`));
+      }
+      resolve({ pix_fmt: video.pix_fmt });
+    });
+  });
+}
+
+// Periodically inspect HLS output while streaming: detect a frozen stream
+// (segments stop advancing) and validate the format of fresh segments.
+function startSegmentWatchdog() {
+  let recovering = false;
+  const checkMs = Math.max(5000, (SEGMENT_STALE_SECONDS * 1000) / 2);
+
+  segmentWatchdog = setInterval(async () => {
+    if (!isStreamReady || isBrowserRestarting || recovering) return;
+
+    let segs;
+    try { segs = listSegments(); } catch { return; }
+    if (segs.length === 0) return; // nothing written yet
+
+    const newest = segs[0];
+    const ageSec = (Date.now() - newest.mtime) / 1000;
+
+    // Freeze: ffmpeg is alive (no 'error' event) but no fresh segments.
+    if (ageSec > SEGMENT_STALE_SECONDS) {
+      console.error(`❌ HLS watchdog: newest segment is ${ageSec.toFixed(1)}s old (> ${SEGMENT_STALE_SECONDS}s) — stream appears frozen.`);
+      recovering = true;
+      console.log('▶ Restarting transcoding to recover stalled stream...');
+      await stopTranscoding();            // clears this watchdog timer
+      setTimeout(startTranscoding, 2000);
+      return;
+    }
+
+    // Validate the last *complete* segment (skip index 0, still being written).
+    const target = segs[1] || newest;
+    if (lastSegmentVerified === target.path) return; // already checked this one
+    try {
+      const info = await probeSegment(target.path);
+      lastSegmentVerified = target.path;
+      console.log(`🔎 HLS watchdog: ${path.basename(target.path)} ok (pix_fmt ${info.pix_fmt}, fresh ${ageSec.toFixed(1)}s ago)`);
+    } catch (err) {
+      console.error('❌ HLS watchdog: segment validation failed:', err.message);
+    }
+  }, checkMs);
+
+  console.log(`🛡️  HLS segment watchdog active (stale threshold ${SEGMENT_STALE_SECONDS}s, checking every ${(checkMs / 1000).toFixed(0)}s)`);
+}
+
+// Capture frames via CDP screencast: Chrome pushes JPEG frames as it composites
+// them, which is far cheaper and higher-throughput than polling page.screenshot()
+// (each screenshot is a blocking CDP round-trip, so the old loop capped out at a
+// handful of fps regardless of FRAME_RATE). Frames are written straight into the
+// FFmpeg image2pipe; the ack is deferred until the pipe drains so Chrome paces
+// itself to the encoder instead of buffering unboundedly.
+async function startScreencast() {
+  await stopScreencast();
+  const client = await page.createCDPSession();
+  cdpClient = client;
+
+  client.on('Page.screencastFrame', async ({ data, sessionId }) => {
+    try {
+      if (ffmpegStream && !ffmpegStream.destroyed && !isBrowserRestarting) {
+        const ok = ffmpegStream.write(Buffer.from(data, 'base64'));
+        if (!ok) await new Promise(resolve => ffmpegStream.once('drain', resolve));
+      }
+    } catch (err) {
+      console.warn('▶ Capture error:', err.message);
+    } finally {
+      // Always ack (even when skipping) or Chrome stops sending frames.
+      client.send('Page.screencastFrameAck', { sessionId }).catch(() => { });
+    }
+  });
+
+  await client.send('Page.startScreencast', {
+    format: 'jpeg',
+    quality: SCREENSHOT_QUALITY,
+    maxWidth: VIEW_DIMENSIONS.width,
+    maxHeight: VIEW_DIMENSIONS.height,
+    everyNthFrame: 1
+  });
+  console.log('🎥 Screencast capture started');
+}
+
+async function stopScreencast() {
+  if (!cdpClient) return;
+  try { await cdpClient.send('Page.stopScreencast'); } catch { }
+  try { await cdpClient.detach(); } catch { }
+  cdpClient = null;
+}
+
 async function startTranscoding() {
   await startBrowser();
   createAudioInputFile();
@@ -248,7 +411,13 @@ async function startTranscoding() {
   ffmpegCmd = ffmpeg()
     .input(ffmpegStream)
     .inputFormat('image2pipe')
-    .addInputOptions(['-framerate', String(FRAME_RATE)])
+    // Stamp each piped frame with its real arrival time instead of assuming a
+    // perfect cadence. The screencast delivers frames at a variable rate (the
+    // page only repaints when content changes), so trusting a fixed framerate
+    // would make the video stream end early while audio runs on — the picture
+    // appears to "freeze" partway through. Wallclock timestamps drive the real
+    // timing; -framerate is just a nominal fallback for the image2pipe demuxer.
+    .addInputOptions(['-use_wallclock_as_timestamps', '1', '-framerate', String(FRAME_RATE)])
     .input(path.join(__dirname, 'audio_list.txt'))
     .addInputOptions(['-f', 'concat', '-safe', '0', '-stream_loop', '-1'])
     .complexFilter([
@@ -257,9 +426,17 @@ async function startTranscoding() {
     ]);
 
   const outputOpts = [
-    '-framerate', String(FRAME_RATE),
+    // Passthrough (VFR) the wallclock-timed frames: encode only what the
+    // capture loop actually produced, stamped at real arrival time. This keeps
+    // video length matched to real elapsed time / audio (no mid-way freeze)
+    // WITHOUT CFR frame-duplication, which would inflate encoder load to the
+    // full FRAME_RATE even when capture runs slower.
+    '-vsync', 'vfr',
     '-map', '[v]', '-map', '[a]',
     '-c:v', 'libx264', '-c:a', 'aac',
+    // JPEG frames encode as full-range yuvj420p, which many players and upload
+    // pipelines reject; force standard yuv420p for broad compatibility.
+    '-pix_fmt', 'yuv420p',
     '-b:a', '128k', '-preset', 'ultrafast', '-b:v', '1000k'
   ];
 
@@ -313,7 +490,7 @@ async function startTranscoding() {
         setTimeout(startTranscoding, 2000);
       }
     })
-    .on('end', () => {
+    .on('end', async () => {
       if (videoProgressInterval) { clearInterval(videoProgressInterval); videoProgressInterval = null; }
       isStreamReady = false;
 
@@ -322,10 +499,22 @@ async function startTranscoding() {
         const fileSize = fs.existsSync(absPath)
           ? `${(fs.statSync(absPath).size / (1024 * 1024)).toFixed(2)} MB`
           : '0 MB';
-        console.log('✅ Recording complete.');
-        console.log(`📁 Final Output: ${absPath} (${fileSize})`);
-        console.log('🔌 Shutting down capture session...\n');
-        stopTranscoding().then(() => process.exit(0));
+
+        // Fail loudly on a broken file instead of reporting success.
+        try {
+          const info = await verifyRecording(absPath, WRITE_VIDEO_LENGTH);
+          console.log('✅ Recording complete and verified.');
+          console.log(`📁 Final Output: ${absPath} (${fileSize})`);
+          console.log(`🔎 Verified: video ${info.vDur.toFixed(1)}s / audio ${info.aDur.toFixed(1)}s / pix_fmt ${info.pix_fmt}`);
+          console.log('🔌 Shutting down capture session...\n');
+          await stopTranscoding();
+          process.exit(0);
+        } catch (verifyErr) {
+          console.error('❌ Recording verification FAILED:', verifyErr.message);
+          console.error(`📁 Bad output left at: ${absPath} (${fileSize}) for inspection`);
+          await stopTranscoding();
+          process.exit(1);
+        }
       }
 
       ffmpegCmd = null;
@@ -333,81 +522,24 @@ async function startTranscoding() {
     })
     .run(); // FIX: .run() is called last; listeners are on the command object, not its return value
 
-  // --- Capture loop ---
-  // FIX: Use a single flag to prevent overlapping async screenshot calls,
-  // and check isBrowserRestarting to avoid firing during browser refresh.
-  let capturing = false;
-
-  captureInterval = setInterval(async () => {
-    if (!ffmpegCmd || !ffmpegStream || !page || isBrowserRestarting) return;
-    if (capturing) return;   // FIX: skip frame if previous screenshot is still pending
-    capturing = true;
-
-    try {
-      if (page.isClosed()) {
-        capturing = false;
-        return;
-      }
-
-      const screenshot = await Promise.race([
-        page.screenshot({ type: 'jpeg', quality: 75 }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Screenshot timeout')), 1000))
-      ]).catch(() => null);
-
-      if (!screenshot) {
-        capturing = false;
-        return;
-      }
-
-      // FIX: Respect backpressure properly — check write() return value and
-      // await 'drain' before continuing, instead of calling the no-op .pause()
-      // on the readable side of the PassThrough.
-      const ok = ffmpegStream.write(screenshot);
-      if (!ok) {
-        await new Promise(resolve => ffmpegStream.once('drain', resolve));
-      }
-    } catch (err) {
-      console.warn('▶ Capture error:', err.message);
-    } finally {
-      capturing = false;
-    }
-  }, 1000 / FRAME_RATE);
+  // --- Capture via CDP screencast (replaces the old screenshot polling loop) ---
+  await startScreencast();
 
   // --- Periodic browser refresh (HLS mode only) ---
-  // FIX: Clear and restart captureInterval around the browser restart so the
-  // loop doesn't fire against a torn-down page.
   if (!isMp4Mode) {
+    lastSegmentVerified = null;
+    startSegmentWatchdog();
+
     browserRefreshTimer = setInterval(async () => {
       console.log('♻️  Recreating browser to prevent memory leaks...');
       isBrowserRestarting = true;
 
-      if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
+      await stopScreencast();
       if (page && !page.isClosed()) await page.close().catch(() => { });
       if (browser) { await browser.close().catch(() => { }); browser = null; page = null; }
 
       await startBrowser();
-
-      // Restart the capture loop with the fresh page reference
-      capturing = false;
-      captureInterval = setInterval(async () => {
-        if (!ffmpegCmd || !ffmpegStream || !page || isBrowserRestarting) return;
-        if (capturing) return;
-        capturing = true;
-        try {
-          if (page.isClosed()) { capturing = false; return; }
-          const screenshot = await Promise.race([
-            page.screenshot({ type: 'jpeg', quality: 75 }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Screenshot timeout')), 1000))
-          ]).catch(() => null);
-          if (!screenshot) { capturing = false; return; }
-          const ok = ffmpegStream.write(screenshot);
-          if (!ok) await new Promise(resolve => ffmpegStream.once('drain', resolve));
-        } catch (err) {
-          console.warn('▶ Capture error:', err.message);
-        } finally {
-          capturing = false;
-        }
-      }, 1000 / FRAME_RATE);
+      await startScreencast();  // re-attach to the fresh page
 
       isBrowserRestarting = false;
       console.log('♻️  Browser restarted successfully.');
@@ -417,8 +549,9 @@ async function startTranscoding() {
 
 async function stopTranscoding() {
   if (videoProgressInterval) { clearInterval(videoProgressInterval); videoProgressInterval = null; }
-  if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
+  if (segmentWatchdog) { clearInterval(segmentWatchdog); segmentWatchdog = null; }
   if (browserRefreshTimer) { clearInterval(browserRefreshTimer); browserRefreshTimer = null; }
+  await stopScreencast();
   isStreamReady = false;
 
   if (ffmpegStream && !ffmpegStream.destroyed) {
