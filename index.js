@@ -7,7 +7,7 @@ const { PassThrough } = require('stream');
 const os = require('os');
 
 const app = express();
-const VERSION = '2.0';
+const VERSION = '2.1';
 
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
@@ -15,10 +15,9 @@ const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
 const STREAM_PORT = process.env.STREAM_PORT || '9798';
 const WS4KP_URL = `http://${WS4KP_HOST}:${WS4KP_PORT}`;
 const PERMALINK_URL = process.env.PERMALINK_URL || null;
-const HLS_SETUP_DELAY = 2000;
 const FRAME_RATE = parseInt(process.env.FRAME_RATE, 10) || 10;
 
-// 🔹 Video Recording Configuration
+// Video Recording Configuration
 const WRITE_VIDEO = ['true', '1', 'yes'].includes((process.env.WRITE_VIDEO || '').toLowerCase());
 const WRITE_VIDEO_LENGTH = WRITE_VIDEO ? (parseInt(process.env.WRITE_VIDEO_LENGTH, 10) || 300) : 0;
 const WRITE_VIDEO_FILENAME = process.env.WRITE_VIDEO_FILENAME || 'output.mp4';
@@ -49,14 +48,16 @@ const VIEW_DIMENSIONS = (() => {
 app.use('/stream', express.static(OUTPUT_DIR));
 app.use('/logo', express.static(LOGO_DIR));
 
-let ffmpegProc = null;
-let ffmpegStream = null;
+// --- Shared state ---
+let ffmpegCmd = null;      // the fluent-ffmpeg command instance (has .kill())
+let ffmpegStream = null;   // the PassThrough pipe into ffmpeg's stdin
 let browser = null;
 let page = null;
 let captureInterval = null;
+let browserRefreshTimer = null;
 let isStreamReady = false;
+let isBrowserRestarting = false;  // guard: pause captures during browser restart
 
-// 🔹 Video Recording State
 let recordingStartTime = null;
 let videoProgressInterval = null;
 
@@ -86,9 +87,6 @@ function getContainerLimits() {
   } catch { }
   return { cpus, memoryMB: Math.round(memory / (1024 * 1024)) };
 }
-
-const load = os.loadavg()[0] / os.cpus().length;
-if (load > 1.5) console.warn('⚠️ High system load detected. Consider lowering FRAME_RATE or using ultrafast preset.');
 
 function createAudioInputFile() {
   const defaultMp3s = [
@@ -146,7 +144,8 @@ async function startBrowser() {
   if (browser) {
     console.log('🔄 Closing existing browser instance...');
     await browser.close().catch(() => { });
-    // Force Node's GC to reclaim Chromium's RAM
+    browser = null;
+    page = null;
     if (global.gc) global.gc();
   }
 
@@ -158,17 +157,13 @@ async function startBrowser() {
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--force-device-scale-factor=1',
-      `--window-size=${VIEW_DIMENSIONS.width},${VIEW_DIMENSIONS.height}`,
-      '--js-flags="--max-old-space-size=512"',       // 🛑 Limits V8 heap, prevents GC pauses
-      '--disable-background-timer-throttling',        // 🛑 Stops OS from throttling timers
-      '--disable-features=VideoCapture',              // 🛑 Disables Chromium's built-in capture scheduler
-      '--disable-renderer-backgrounding'              // 🛑 Keeps renderer process priority high
+      `--window-size=${VIEW_DIMENSIONS.width},${VIEW_DIMENSIONS.height}`
     ],
-    defaultViewport: null,
-    ignoreDefaultArgs: ['--enable-automation']         // Removes puppeteer bloat
+    defaultViewport: null
   });
 
   page = await browser.newPage();
+
   if (PERMALINK_URL) {
     console.log(`Using custom permalink URL: ${PERMALINK_URL}`);
     await page.goto(PERMALINK_URL, { waitUntil: 'networkidle2', timeout: 30000 });
@@ -189,17 +184,19 @@ async function startBrowser() {
     try {
       const widescreenCheckbox = await page.waitForSelector('#settings-wide-checkbox', { timeout: 100 });
       if (VIEW_MODE === 'wide-enhanced' || VIEW_MODE === 'portrait-enhanced') {
-        console.error(`This version of ws4kp only supports VIEW_MODE 'standard' or 'enhanced'`);
+        console.error(`This version of ws4kp only supports VIEW_MODE 'standard' or 'wide'`);
         await browser.close();
         process.exit(1);
       }
       const widescreenChecked = await widescreenCheckbox.evaluate((el) => el.checked);
-      if (widescreenChecked && VIEW_MODE === 'standard' || !widescreenChecked && VIEW_MODE === 'wide') await widescreenCheckbox.click();
+      if ((widescreenChecked && VIEW_MODE === 'standard') || (!widescreenChecked && VIEW_MODE === 'wide')) {
+        await widescreenCheckbox.click();
+      }
     } catch {
       try {
         const viewSelector = await page.waitForSelector('#settings-viewMode-select');
-        await viewSelector.evaluate((el, VIEW_MODE) => {
-          el.value = VIEW_MODE;
+        await viewSelector.evaluate((el, vm) => {
+          el.value = vm;
           el.dispatchEvent(new Event('change'));
         }, VIEW_MODE);
       } catch { }
@@ -210,7 +207,6 @@ async function startBrowser() {
       if (!kioskChecked) await kioskCheckbox.click();
     }
   }
-  await page.setViewport({ ...VIEW_DIMENSIONS });
 
   await page.setViewport({
     width: VIEW_DIMENSIONS.width,
@@ -218,7 +214,6 @@ async function startBrowser() {
     deviceScaleFactor: 1
   });
 
-  // Force DOM layout to match viewport exactly (prevents layout shifts under load)
   await page.evaluate((w, h) => {
     document.body.style.margin = '0';
     document.body.style.padding = '0';
@@ -237,7 +232,6 @@ async function startTranscoding() {
     ? path.join(OUTPUT_DIR, WRITE_VIDEO_FILENAME)
     : HLS_FILE;
 
-  // 🔹 EXPLICIT VIDEO RECORDING NOTIFICATION
   if (isMp4Mode) {
     const absPath = path.resolve(outputPath);
     console.log('\n' + '='.repeat(60));
@@ -248,14 +242,17 @@ async function startTranscoding() {
     console.log('='.repeat(60) + '\n');
   }
 
-  const ffmpegCmd = ffmpeg()
+  // FIX: Build the command, attach listeners, THEN call .run().
+  // Previously .run() was called first and its (void) return value was used
+  // for .on() — so no events ever fired.
+  ffmpegCmd = ffmpeg()
     .input(ffmpegStream)
     .inputFormat('image2pipe')
-    .addInputOptions(['-framerate', String(FRAME_RATE), '-vsync', 'cfr']) // ✅ Constant Frame Rate sync
+    .addInputOptions(['-framerate', String(FRAME_RATE)])
     .input(path.join(__dirname, 'audio_list.txt'))
     .addInputOptions(['-f', 'concat', '-safe', '0', '-stream_loop', '-1'])
     .complexFilter([
-      `[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}:flags=bilinear[v]`,
+      `[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`,
       `[1:a]volume=0.5[a]`
     ]);
 
@@ -273,14 +270,11 @@ async function startTranscoding() {
     outputOpts.push('-f', 'hls', '-hls_time', '2', '-hls_list_size', '2', '-hls_flags', 'delete_segments');
   }
 
-  ffmpegCmd.outputOptions(outputOpts);
-  ffmpegCmd.output(outputPath);
-
-  ffmpegProc = ffmpegCmd.run();
-
-  ffmpegProc
-    .on('start', () => {
-      console.log('▶ FFmpeg capture stream initialized');
+  ffmpegCmd
+    .outputOptions(outputOpts)
+    .output(outputPath)
+    .on('start', (cmdLine) => {
+      console.log('▶ FFmpeg started');
       isStreamReady = true;
       recordingStartTime = Date.now();
 
@@ -293,14 +287,13 @@ async function startTranscoding() {
           const eStr = `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)}`;
           const tStr = `${pad(Math.floor(WRITE_VIDEO_LENGTH / 60))}:${pad(WRITE_VIDEO_LENGTH % 60)}`;
           console.log(`▶ RECORDING: ${eStr} / ${tStr} (${percent}%) | Writing to: ${outputPath}`);
-
           if (remaining <= 10 && remaining > 0) {
             console.log(`⚠️  Recording will finalize in ${remaining} seconds...`);
           }
         }, 5000);
-      }
 
-      if (isMp4Mode && WRITE_VIDEO_LENGTH > 0) {
+        // End the input stream when the desired duration is reached, letting
+        // FFmpeg finish gracefully rather than being killed mid-write.
         setTimeout(() => {
           if (ffmpegStream && !ffmpegStream.destroyed) {
             clearInterval(videoProgressInterval);
@@ -310,11 +303,9 @@ async function startTranscoding() {
         }, WRITE_VIDEO_LENGTH * 1000);
       }
     })
-    .on('progress', (progress) => {
-      // Optional: Uncomment to see raw FFmpeg frame/size progress
-      // console.log(`▶ FFmpeg progress: ${progress.percent}% frames processed`);
-    })
     .on('error', async (err) => {
+      // Ignore "pipe closed" errors that come from a clean ffmpegStream.end()
+      if (err.message.includes('pipe') || err.message.includes('SIGKILL')) return;
       console.error('▶ FFmpeg error:', err.message);
       await stopTranscoding();
       if (!isMp4Mode) {
@@ -323,109 +314,131 @@ async function startTranscoding() {
       }
     })
     .on('end', () => {
-      if (videoProgressInterval) clearInterval(videoProgressInterval);
-      ffmpegProc = null;
-      ffmpegStream = null;
+      if (videoProgressInterval) { clearInterval(videoProgressInterval); videoProgressInterval = null; }
       isStreamReady = false;
 
       if (isMp4Mode) {
         const absPath = path.resolve(outputPath);
-        const fileSize = fs.existsSync(absPath) ? `${(fs.statSync(absPath).size / (1024 * 1024)).toFixed(2)} MB` : '0 MB';
+        const fileSize = fs.existsSync(absPath)
+          ? `${(fs.statSync(absPath).size / (1024 * 1024)).toFixed(2)} MB`
+          : '0 MB';
         console.log('✅ Recording complete.');
         console.log(`📁 Final Output: ${absPath} (${fileSize})`);
         console.log('🔌 Shutting down capture session...\n');
-        stopTranscoding();
-        process.exit(0);
+        stopTranscoding().then(() => process.exit(0));
       }
-    });
 
-  let streamPaused = false;
-  let lastFrameTimestamp = Date.now();
-  const STALL_THRESHOLD_MS = 4000; // Freeze if no frames for 4s
-  const QUEUE_MAX_SIZE = 3;        // Drop frames if pipe backs up
-  let captureQueue = [];
+      ffmpegCmd = null;
+      ffmpegStream = null;
+    })
+    .run(); // FIX: .run() is called last; listeners are on the command object, not its return value
 
-  function drainHandler() {
-    streamPaused = false;
-  }
-
-  ffmpegStream.on('drain', drainHandler);
+  // --- Capture loop ---
+  // FIX: Use a single flag to prevent overlapping async screenshot calls,
+  // and check isBrowserRestarting to avoid firing during browser refresh.
+  let capturing = false;
 
   captureInterval = setInterval(async () => {
-    if (!ffmpegProc || !page || page.isClosed()) return;
-
-    // 🔹 Stall recovery watchdog
-    if (Date.now() - lastFrameTimestamp > STALL_THRESHOLD_MS) {
-      console.warn('\n⚠️ Stream stall detected! Forcing browser refresh...');
-      try {
-        await page.reload({ waitUntil: 'networkidle2', timeout: 10000 });
-        await new Promise(r => setTimeout(r, 600)); // Let DOM settle
-        console.log('✅ Recovery complete.');
-        lastFrameTimestamp = Date.now();
-      } catch (e) {
-        console.error('🚨 Stall recovery failed:', e.message);
-        stopTranscoding(); // Safe fallback
-        process.exit(1);
-      }
-      return;
-    }
+    if (!ffmpegCmd || !ffmpegStream || !page || isBrowserRestarting) return;
+    if (capturing) return;   // FIX: skip frame if previous screenshot is still pending
+    capturing = true;
 
     try {
-      // 🛑 Strict timeout prevents V8 starvation cascades
-      const frame = await Promise.race([
-        page.screenshot({ type: 'jpeg', quality: 65 }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('screenshot_timeout')), 100))
+      if (page.isClosed()) {
+        capturing = false;
+        return;
+      }
+
+      const screenshot = await Promise.race([
+        page.screenshot({ type: 'jpeg', quality: 75 }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Screenshot timeout')), 1000))
       ]).catch(() => null);
 
-      if (!frame) return; // Drop frame, keep loop running
+      if (!screenshot) {
+        capturing = false;
+        return;
+      }
 
-      lastFrameTimestamp = Date.now();
-
-      // 🔹 Bounded queue prevents memory bloat
-      captureQueue.push(frame);
-      while (captureQueue.length > QUEUE_MAX_SIZE) captureQueue.shift();
-
-      const drained = ffmpegStream.write(captureQueue.shift());
-      if (!drained && !streamPaused) {
-        console.log('▶ Buffer full, pausing capture loop...');
-        streamPaused = true;
-        clearInterval(captureInterval);
-
-        // Resume only when FFmpeg catches up
-        const resumeTimeout = setInterval(() => {
-          if (streamPaused) return;
-          clearInterval(resumeTimeout);
-          captureInterval = setInterval(captureLoop, 1000 / FRAME_RATE);
-        }, 200);
+      // FIX: Respect backpressure properly — check write() return value and
+      // await 'drain' before continuing, instead of calling the no-op .pause()
+      // on the readable side of the PassThrough.
+      const ok = ffmpegStream.write(screenshot);
+      if (!ok) {
+        await new Promise(resolve => ffmpegStream.once('drain', resolve));
       }
     } catch (err) {
       console.warn('▶ Capture error:', err.message);
-      lastFrameTimestamp = Date.now(); // Prevent false watchdog triggers
+    } finally {
+      capturing = false;
     }
   }, 1000 / FRAME_RATE);
 
-  // Helper for capture loop reuse
-  function captureLoop() { /* same as setInterval callback above */ }
+  // --- Periodic browser refresh (HLS mode only) ---
+  // FIX: Clear and restart captureInterval around the browser restart so the
+  // loop doesn't fire against a torn-down page.
+  if (!isMp4Mode) {
+    browserRefreshTimer = setInterval(async () => {
+      console.log('♻️  Recreating browser to prevent memory leaks...');
+      isBrowserRestarting = true;
 
-  // Resume only when FFmpeg is ready to accept more data
-  ffmpegStream.on('drain', () => {
-    if (streamPaused) {
-      console.log('▶ Stream buffer cleared, resuming captures...');
-      streamPaused = false;
-      ffmpegStream.resume();
-    }
-  });
+      if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
+      if (page && !page.isClosed()) await page.close().catch(() => { });
+      if (browser) { await browser.close().catch(() => { }); browser = null; page = null; }
+
+      await startBrowser();
+
+      // Restart the capture loop with the fresh page reference
+      capturing = false;
+      captureInterval = setInterval(async () => {
+        if (!ffmpegCmd || !ffmpegStream || !page || isBrowserRestarting) return;
+        if (capturing) return;
+        capturing = true;
+        try {
+          if (page.isClosed()) { capturing = false; return; }
+          const screenshot = await Promise.race([
+            page.screenshot({ type: 'jpeg', quality: 75 }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Screenshot timeout')), 1000))
+          ]).catch(() => null);
+          if (!screenshot) { capturing = false; return; }
+          const ok = ffmpegStream.write(screenshot);
+          if (!ok) await new Promise(resolve => ffmpegStream.once('drain', resolve));
+        } catch (err) {
+          console.warn('▶ Capture error:', err.message);
+        } finally {
+          capturing = false;
+        }
+      }, 1000 / FRAME_RATE);
+
+      isBrowserRestarting = false;
+      console.log('♻️  Browser restarted successfully.');
+    }, 10 * 60 * 1000);
+  }
 }
 
 async function stopTranscoding() {
   if (videoProgressInterval) { clearInterval(videoProgressInterval); videoProgressInterval = null; }
   if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
+  if (browserRefreshTimer) { clearInterval(browserRefreshTimer); browserRefreshTimer = null; }
   isStreamReady = false;
-  if (ffmpegStream) { try { ffmpegStream.end(); } catch { } }
-  if (ffmpegProc) { try { ffmpegProc.kill('SIGINT'); } catch { } ffmpegProc = null; }
-  if (browser) { await browser.close().catch(() => { }); browser = null; }
+
+  if (ffmpegStream && !ffmpegStream.destroyed) {
+    try { ffmpegStream.end(); } catch { }
+  }
+
+  // FIX: ffmpegCmd is the fluent-ffmpeg command object and does have .kill().
+  // The old code stored the return value of .run() (which is void/undefined)
+  // so .kill() was called on undefined and silently failed.
+  if (ffmpegCmd) {
+    try { ffmpegCmd.kill('SIGINT'); } catch { }
+    ffmpegCmd = null;
+  }
+  ffmpegStream = null;
+
   if (page) { try { await page.close(); } catch { } page = null; }
+  if (browser) { await browser.close().catch(() => { }); browser = null; }
 }
+
+// --- Routes ---
 
 app.get('/playlist.m3u', (req, res) => {
   const host = req.headers.host || `localhost:${STREAM_PORT}`;
@@ -434,17 +447,21 @@ app.get('/playlist.m3u', (req, res) => {
 #EXTINF:-1 channel-id="weatherStar4000" tvg-id="weatherStar4000" tvg-channel-no="275" tvc-guide-placeholders="3600" tvc-guide-title="Local Weather" tvc-guide-description="Enjoy your local weather with a touch of nostalgia." tvc-guide-art="${baseUrl}/logo/ws4000.png" tvg-logo="${baseUrl}/logo/ws4000.png",WeatherStar 4000
 ${baseUrl}/stream/stream.m3u8
 `;
-  res.set('Content-Type', 'application/x-mpegURL'); res.send(m3uContent);
+  res.set('Content-Type', 'application/x-mpegURL');
+  res.send(m3uContent);
 });
 
 app.get('/guide.xml', (req, res) => {
   const host = req.headers.host || `localhost:${STREAM_PORT}`;
-  res.set('Content-Type', 'application/xml'); res.send(generateXMLTV(host));
+  res.set('Content-Type', 'application/xml');
+  res.send(generateXMLTV(host));
 });
 
 app.get('/health', (req, res) => {
   res.status(isStreamReady ? 200 : 503).json({ ready: isStreamReady });
 });
+
+// --- Boot ---
 
 const { cpus, memoryMB } = getContainerLimits();
 console.log(`Version ${VERSION} | Running with ${cpus} CPU cores, ${memoryMB}MB RAM`);
@@ -459,6 +476,7 @@ process.on('SIGINT', async () => {
   await stopTranscoding();
   process.exit(0);
 });
+
 process.on('SIGTERM', async () => {
   console.log('\n▶ SIGTERM received. Stopping capture...');
   await stopTranscoding();
